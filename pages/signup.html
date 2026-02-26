@@ -7,17 +7,43 @@
   <meta name="description" content="Sign up for a free EzBiz Business Intelligence API key. 10 requests per month, all 4 tools included. No credit card required.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=2">
 </head>
 <body>
 
 <nav>
   <div class="container">
     <a href="/" class="logo"><span>EzBiz</span> Business Intelligence</a>
+    <button class="nav-toggle" aria-label="Toggle menu">
+      <span></span><span></span><span></span>
+    </button>
     <div class="nav-links">
+      <button class="mega-trigger" type="button">Tools <svg class="caret" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
       <a href="/docs">Docs</a>
       <a href="/pricing">Pricing</a>
       <a href="/signup" class="btn-nav">Get Free API Key</a>
+    </div>
+  </div>
+  <div class="mega-panel">
+    <div class="container">
+      <div class="mega-grid">
+        <a href="/tools/analyze-competitors" class="mega-card blue">
+          <div class="mega-name">Competitor Analysis</div>
+          <div class="mega-desc">Map competitive landscapes and positioning</div>
+        </a>
+        <a href="/tools/score-web-presence" class="mega-card purple">
+          <div class="mega-name">Web Presence Score</div>
+          <div class="mega-desc">Score any website 0-100 across key metrics</div>
+        </a>
+        <a href="/tools/analyze-reviews" class="mega-card green">
+          <div class="mega-name">Review Analysis</div>
+          <div class="mega-desc">Aggregate and analyze online reviews</div>
+        </a>
+        <a href="/tools/market-research" class="mega-card orange">
+          <div class="mega-name">Market Research</div>
+          <div class="mega-desc">Industry research with trends and segments</div>
+        </a>
+      </div>
     </div>
   </div>
 </nav>
@@ -43,9 +69,9 @@
       <div class="error-msg" id="errorMsg"></div>
 
       <div class="key-result" id="keyResult">
-        <h3>Your API Key</h3>
+        <h3 id="keyResultTitle">Your API Key</h3>
         <div class="api-key" id="apiKeyDisplay" title="Click to copy"></div>
-        <p>Copy this key — it won't be shown again. See the <a href="/docs">docs</a> to connect.</p>
+        <p id="keyResultMsg">Copy this key — it won't be shown again. See the <a href="/docs">docs</a> to connect.</p>
       </div>
     </div>
 
@@ -57,7 +83,7 @@
 
 <footer>
   <div class="container">
-    <p>&copy; 2026 EzBiz Services. Built with MCP.</p>
+    <p>&copy; 2026 EzBiz Services. Built with MCP. &nbsp;|&nbsp; <a href="mailto:hello@ezbizservices.com" style="color:var(--text-muted)">hello@ezbizservices.com</a></p>
   </div>
 </footer>
 
@@ -91,6 +117,10 @@ async function handleSignup(e) {
     }
 
     document.getElementById('apiKeyDisplay').textContent = data.key;
+    if (data.recovered) {
+      document.getElementById('keyResultTitle').textContent = 'Welcome back! Here\u2019s your API key';
+      document.getElementById('keyResultMsg').innerHTML = 'You\u2019re on the <strong>' + data.tier + '</strong> tier (' + data.used + '/' + data.limit + ' requests used this month). See the <a href="/docs">docs</a> to connect.';
+    }
     keyResult.style.display = 'block';
     form.style.display = 'none';
 
@@ -112,5 +142,66 @@ async function handleSignup(e) {
 }
 </script>
 
+<script>
+(function(){
+  var trigger = document.querySelector('.mega-trigger');
+  var panel = document.querySelector('.mega-panel');
+  var toggle = document.querySelector('.nav-toggle');
+  var links = document.querySelector('.nav-links');
+  if (!trigger || !panel) return;
+
+  trigger.addEventListener('click', function(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    panel.classList.toggle('open');
+    trigger.classList.toggle('active');
+  });
+
+  document.addEventListener('click', function(e) {
+    if (!panel.contains(e.target) && !trigger.contains(e.target)) {
+      panel.classList.remove('open');
+      trigger.classList.remove('active');
+    }
+    if (toggle && links && !links.contains(e.target) && !toggle.contains(e.target)) {
+      links.classList.remove('mobile-open');
+      toggle.classList.remove('open');
+    }
+  });
+
+  var hoverTimeout;
+  trigger.addEventListener('mouseenter', function() {
+    if (window.innerWidth > 768) {
+      clearTimeout(hoverTimeout);
+      panel.classList.add('open');
+      trigger.classList.add('active');
+    }
+  });
+  function scheduleClose() {
+    hoverTimeout = setTimeout(function() {
+      panel.classList.remove('open');
+      trigger.classList.remove('active');
+    }, 250);
+  }
+  trigger.addEventListener('mouseleave', function() {
+    if (window.innerWidth > 768) scheduleClose();
+  });
+  panel.addEventListener('mouseenter', function() {
+    if (window.innerWidth > 768) clearTimeout(hoverTimeout);
+  });
+  panel.addEventListener('mouseleave', function() {
+    if (window.innerWidth > 768) scheduleClose();
+  });
+
+  if (toggle && links) {
+    toggle.addEventListener('click', function(e) {
+      e.stopPropagation();
+      toggle.classList.toggle('open');
+      links.classList.toggle('mobile-open');
+      panel.classList.remove('open');
+      trigger.classList.remove('active');
+    });
+  }
+})();
+</script>
 </body>
 </html>
