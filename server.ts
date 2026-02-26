@@ -8,6 +8,7 @@ import { z } from "zod";
 import { validateApiKey, recordUsage, createApiKey, getKeyByEmail, upgradeKey, getKeyUsage, TIER_LIMITS, TIER_PRICES } from "./lib/auth";
 import type { Tier } from "./lib/auth";
 import { log } from "./lib/logger";
+import { handleOAuthRoute, unauthorizedResponse, type OAuthConfig } from "./lib/oauth";
 import { analyzeCompetitors } from "./tools/competitor-analysis";
 import { scoreWebPresence } from "./tools/web-presence-score";
 import { analyzeReviews } from "./tools/review-analysis";
@@ -67,7 +68,7 @@ function createMcpServer(): McpServer {
     "analyze_competitors",
     "Analyze the competitive landscape for a business. Returns competitor profiles, market positioning, strengths/weaknesses, and strategic recommendations.",
     {
-      business_name: z.string().describe("Name of the business to analyze"),
+      business_name: z.string().describe("Name of the business to analyze (e.g., 'Acme Plumbing')"),
       industry: z
         .string()
         .describe("Industry or market sector (e.g., 'SaaS', 'local plumbing', 'e-commerce')"),
@@ -77,8 +78,9 @@ function createMcpServer(): McpServer {
         .describe("Geographic location for local businesses (e.g., 'Austin, TX')"),
       website_url: z
         .string()
+        .url()
         .optional()
-        .describe("The business's own website URL for comparison"),
+        .describe("The business's website URL for comparison (e.g., 'https://example.com')"),
     },
     async (params) => {
       const result = await analyzeCompetitors(params);
@@ -91,11 +93,11 @@ function createMcpServer(): McpServer {
     "score_web_presence",
     "Score a website's online presence (0-100) across SEO, performance, content, social media, and trust signals. Returns detailed breakdown and actionable recommendations.",
     {
-      url: z.string().describe("Website URL to analyze (e.g., 'example.com' or 'https://example.com')"),
+      url: z.string().describe("Website URL to analyze (e.g., 'https://example.com')"),
       business_name: z
         .string()
         .optional()
-        .describe("Business name to check social media presence"),
+        .describe("Business name to check social media presence and brand mentions"),
     },
     async (params) => {
       const result = await scoreWebPresence(params);
@@ -150,14 +152,19 @@ function createMcpServer(): McpServer {
   return server;
 }
 
+// Export for Smithery tool scanning (no real credentials needed)
+export function createSandboxServer() {
+  return createMcpServer();
+}
+
 // --- Session management ---
 const transports: Record<
   string,
   { transport: WebStandardStreamableHTTPServerTransport; apiKey: string }
 > = {};
 
-// --- Bun HTTP server ---
-Bun.serve({
+// --- Bun HTTP server (guarded for Smithery scanner compatibility) ---
+if (typeof Bun !== "undefined" && !process.env.SMITHERY_SCAN) Bun.serve({
   port: PORT,
   async fetch(req) {
     const url = new URL(req.url);
@@ -176,13 +183,24 @@ Bun.serve({
     // CORS headers for storefront
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, X-API-Key, X-Admin-Secret",
+      "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, X-Admin-Secret, Mcp-Session-Id, Accept",
+      "Access-Control-Expose-Headers": "Mcp-Session-Id",
     };
 
     if (req.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
+
+    // --- OAuth 2.0 + PKCE for MCP clients (Claude, etc.) ---
+    const oauthConfig: OAuthConfig = {
+      issuerUrl: "https://mcp.ezbizservices.com",
+      serverName: "EzBiz Business Intelligence",
+      validateKey: validateApiKey,
+      corsHeaders,
+    };
+    const oauthResponse = await handleOAuthRoute(req, url, oauthConfig);
+    if (oauthResponse) return oauthResponse;
 
     const ADMIN_SECRET = process.env.ADMIN_SECRET;
     if (!ADMIN_SECRET) {
@@ -199,13 +217,19 @@ Bun.serve({
         if (!email || !name) {
           return Response.json({ error: "name and email required" }, { status: 400, headers: corsHeaders });
         }
-        // Check if email already has a key
+        // Check if email already has a key — return it (same security model as signup)
         const existing = await getKeyByEmail(email);
         if (existing) {
+          const month = new Date().toISOString().slice(0, 7);
+          const used = existing.data.usage[month] || 0;
+          const limit = TIER_LIMITS[existing.data.tier] || 10;
           return Response.json({
-            error: "Email already registered",
+            key: existing.key,
             tier: existing.data.tier,
-          }, { status: 409, headers: corsHeaders });
+            limit,
+            used,
+            recovered: true,
+          }, { headers: corsHeaders });
         }
         const key = await createApiKey(name, "free", email);
         await log("info", `New free signup: ${email}`, { name });
@@ -272,21 +296,58 @@ Bun.serve({
       }, { headers: corsHeaders });
     }
 
-    // MCP endpoint — delegate to WebStandard transport
-    if (url.pathname === "/mcp") {
-      // --- API key auth ---
+    // MCP endpoint — accept on /mcp and also on / for POST (Smithery/scanners)
+    if (url.pathname === "/mcp" || (url.pathname === "/" && req.method === "POST")) {
+      // --- API key auth (accept from multiple sources for proxy compatibility) ---
+      const bearerToken = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
       const apiKey =
-        req.headers.get("x-api-key") || url.searchParams.get("api_key");
+        req.headers.get("x-api-key") ||
+        req.headers.get("apikey") ||
+        url.searchParams.get("api_key") ||
+        url.searchParams.get("apiKey") ||
+        url.searchParams.get("apikey") ||
+        bearerToken;
 
-      const authResult = await validateApiKey(apiKey);
+      // Debug logging — include query params to diagnose proxy issues
+      const qp = url.search || "none";
+      console.log(`[MCP] ${req.method} ${url.pathname} | auth: ${bearerToken ? "Bearer " + bearerToken.slice(0, 12) + "..." : "none"} | x-api-key: ${req.headers.get("x-api-key") ? "yes" : "no"} | apikey-hdr: ${req.headers.get("apikey") ? "yes" : "no"} | query: ${qp} | session: ${req.headers.get("mcp-session-id") || "none"} | accept: ${req.headers.get("accept") || "none"}`);
+
+      // Allow unauthenticated access for discovery methods (initialize, tools/list)
+      // so directory scanners (Smithery, etc.) can inspect capabilities.
+      // Auth is still enforced for tools/call (see usage recording below).
+      let authResult: { valid: boolean; error?: string; tier?: string; name?: string } = { valid: false };
+      let isDiscoveryRequest = false;
+
+      if (req.method === "POST" && !apiKey) {
+        try {
+          const cloned = req.clone();
+          const body = await cloned.json();
+          const method = body?.method;
+          if (method === "initialize" || method === "tools/list" || method === "notifications/initialized") {
+            isDiscoveryRequest = true;
+            authResult = { valid: true, tier: "discovery", name: "scanner" };
+          }
+        } catch {}
+      }
+
+      if (!isDiscoveryRequest) {
+        authResult = await validateApiKey(apiKey);
+      }
+
       if (!authResult.valid) {
-        return Response.json(
-          {
+        console.log(`[MCP] AUTH FAILED: ${authResult.error} | key: ${apiKey ? apiKey.slice(0, 12) + "..." : "null"}`);
+        return new Response(JSON.stringify({
             jsonrpc: "2.0",
             error: { code: -32001, message: authResult.error },
             id: null,
-          },
-          { status: 401 }
+          }), {
+            status: 401,
+            headers: {
+              "Content-Type": "application/json",
+              "WWW-Authenticate": `Bearer resource_metadata="https://mcp.ezbizservices.com/.well-known/oauth-protected-resource"`,
+              ...corsHeaders,
+            },
+          }
         );
       }
 
@@ -297,12 +358,18 @@ Bun.serve({
         // Existing session — pass through to its transport
         const { transport } = transports[sessionId];
 
-        // Record usage for tool calls
-        if (req.method === "POST" && apiKey) {
+        // Record usage for tool calls and block unauthenticated tool calls
+        if (req.method === "POST") {
           try {
             const cloned = req.clone();
             const body = await cloned.json();
             if (body?.method === "tools/call") {
+              if (!apiKey) {
+                return Response.json(
+                  { jsonrpc: "2.0", error: { code: -32001, message: "API key required for tool calls. Get a free key at https://mcp.ezbizservices.com" }, id: body?.id || null },
+                  { status: 401 }
+                );
+              }
               await recordUsage(apiKey);
             }
           } catch {}
@@ -366,6 +433,12 @@ Bun.serve({
     }
 
     // --- Static files ---
+    // Serve sitemap and robots from static dir
+    if (url.pathname === "/sitemap.xml" || url.pathname === "/robots.txt") {
+      const staticRes = await serveStatic("/static" + url.pathname);
+      if (staticRes) return staticRes;
+    }
+
     if (url.pathname.startsWith("/static/") || url.pathname.startsWith("/.well-known/")) {
       const staticRes = await serveStatic(url.pathname);
       if (staticRes) return staticRes;
@@ -377,8 +450,16 @@ Bun.serve({
       "/docs": "docs.html",
       "/signup": "signup.html",
       "/pricing": "pricing.html",
+      "/tools/analyze-competitors": "tools/analyze-competitors.html",
+      "/tools/competitor-analysis": "tools/competitor-analysis.html",
+      "/tools/score-web-presence": "tools/score-web-presence.html",
+      "/tools/web-presence-scoring": "tools/web-presence-scoring.html",
+      "/tools/analyze-reviews": "tools/analyze-reviews.html",
+      "/tools/review-analysis": "tools/review-analysis.html",
+      "/tools/market-research": "tools/market-research.html",
     };
 
+    // Check static page routes first
     const pageName = PAGE_ROUTES[url.pathname];
     if (pageName) {
       try {
@@ -390,11 +471,34 @@ Bun.serve({
       }
     }
 
+    // Dynamic blog routes: /blog → index, /blog/[slug] → blog post
+    if (url.pathname === "/blog" || url.pathname === "/blog/") {
+      try {
+        const html = await loadPage("blog/index.html");
+        return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+      } catch (err: any) {
+        await log("error", `Blog index error: ${err.message}`);
+        return new Response("Blog not found", { status: 404 });
+      }
+    }
+
+    if (url.pathname.startsWith("/blog/")) {
+      const slug = url.pathname.replace("/blog/", "");
+      if (slug && /^[a-z0-9-]+$/.test(slug)) {
+        try {
+          const html = await loadPage(`blog/${slug}.html`);
+          return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+        } catch (err: any) {
+          return new Response("Post not found", { status: 404 });
+        }
+      }
+    }
+
     return new Response("Not found", { status: 404 });
   },
 });
 
-console.log(`MCP Business Intelligence server running on port ${PORT}`);
+if (typeof Bun !== "undefined" && !process.env.SMITHERY_SCAN) console.log(`MCP Business Intelligence server running on port ${PORT}`);
 
 // Graceful shutdown
 process.on("SIGINT", async () => {
